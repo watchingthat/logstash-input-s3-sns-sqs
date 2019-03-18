@@ -106,10 +106,6 @@ class LogStash::Inputs::S3SNSSQS < LogStash::Inputs::Threadable
   #Sometimes you need another key for s3. This is a first test...
   config :s3_access_key_id, :validate => :string
   config :s3_secret_access_key, :validate => :string
-  config :queue_owner_aws_account_id, :validate => :string, :required => false
-  #If you have different file-types in you s3 bucket, you could define codec by folder
-  #set_codec_by_folder => {"My-ELB-logs" => "plain"}
-  config :set_codec_by_folder, :validate => :hash, :default => {}
   config :delete_on_success, :validate => :boolean, :default => false
   config :sqs_explicit_delete, :validate => :boolean, :default => false
   # Whether the event is processed though an SNS to SQS. (S3>SNS>SQS = true |S3>SQS=false)
@@ -146,8 +142,6 @@ class LogStash::Inputs::S3SNSSQS < LogStash::Inputs::Threadable
     require "aws-sdk-resources"
 
     @runner_threads = []
-    #make this hash keys lookups match like regex
-    hash_key_is_regex(set_codec_by_folder)
     @logger.info("Registering SQS input", :queue => @queue)
     setup_queue
 
@@ -156,7 +150,7 @@ class LogStash::Inputs::S3SNSSQS < LogStash::Inputs::Threadable
 
   def setup_queue
     aws_sqs_client = Aws::SQS::Client.new(aws_options_hash)
-    queue_url = aws_sqs_client.get_queue_url({ queue_name: @queue, queue_owner_aws_account_id: @queue_owner_aws_account_id})[:queue_url]
+    queue_url = aws_sqs_client.get_queue_url({ queue_name: @queue })[:queue_url]
     @poller = Aws::SQS::QueuePoller.new(queue_url, :client => aws_sqs_client)
     get_s3client
     @s3_resource = get_s3object
@@ -200,28 +194,22 @@ class LogStash::Inputs::S3SNSSQS < LogStash::Inputs::Threadable
           bucket = CGI.unescape(record['s3']['bucket']['name'])
           key    = CGI.unescape(record['s3']['object']['key'])
           size   = record['s3']['object']['size']
-          type_folder = get_object_folder(key)
-          # Set input codec by :set_codec_by_folder
-          instance_codec = set_codec(type_folder) unless set_codec_by_folder["#{type_folder}"].nil?
+          folder = get_object_folder(key)
           # try download and :skip_delete if it fails
-          #if record['s3']['object']['size'] < 10000000 then
-          process_log(bucket, key, type_folder, instance_codec, queue, message, size)
-          #else
-          #  @logger.info("Your file is too big")
-          #end
+          process_s3_file(bucket, key, folder, instance_codec, queue, message, size)
         end
       end
     end
   end
 
   private
-  def process_log(bucket , key, folder, instance_codec, queue, message, size)
+  def process_s3_file(bucket , key, folder, instance_codec, queue, message, size)
     s3bucket = @s3_resource.bucket(bucket)
     @logger.debug("Lets go reading file", :bucket => bucket, :key => key)
     object = s3bucket.object(key)
     filename = File.join(temporary_directory, File.basename(key))
     if download_remote_file(object, filename)
-      if process_local_log( filename, key, folder, instance_codec, queue, bucket, message, size)
+      if process_local_file( filename, key, folder, instance_codec, queue, bucket, message, size)
         begin
           FileUtils.remove_entry_secure(filename, true) if File.exists? filename
           delete_file_from_bucket(object)
@@ -268,9 +256,8 @@ class LogStash::Inputs::S3SNSSQS < LogStash::Inputs::Threadable
   # @param [Queue] Where to push the event
   # @param [String] Which file to read from
   # @return [Boolean] True if the file was completely read, false otherwise.
-  def process_local_log(filename, key, folder, instance_codec, queue, bucket, message, size)
+  def process_local_file(filename, key, folder, instance_codec, queue, bucket, message, size)
     @logger.debug('Processing file', :filename => filename)
-    metadata = {}
     start_time = Time.now
     # Currently codecs operates on bytes instead of stream.
     # So all IO stuff: decompression, reading need to be done in the actual
@@ -289,48 +276,33 @@ class LogStash::Inputs::S3SNSSQS < LogStash::Inputs::Threadable
       #@logger.debug("read line", :line => line)
       instance_codec.decode(line) do |event|
         @logger.debug("decorate event")
-        # We are making an assumption concerning cloudfront
-        # log format, the user will use the plain or the line codec
-        # and the message key will represent the actual line content.
-        # If the event is only metadata the event will be drop.
-        # This was the behavior of the pre 1.5 plugin.
-        #
         # The line need to go through the codecs to replace
         # unknown bytes in the log stream before doing a regexp match or
         # you will get a `Error: invalid byte sequence in UTF-8'
-        local_decorate_and_queue(event, queue, key, folder, metadata, bucket)
+        local_decorate_and_queue(event, queue, key, folder, bucket)
       end
     end
     @logger.debug("end if file #{filename}")
     #@logger.info("event pre flush", :event => event)
     # #ensure any stateful codecs (such as multi-line ) are flushed to the queue
     instance_codec.flush do |event|
-      local_decorate_and_queue(event, queue, key, folder, metadata, bucket)
+      local_decorate_and_queue(event, queue, key, folder, bucket)
       @logger.debug("We´e to flush an incomplete event...", :event => event)
     end
 
     return true
-  end # def process_local_log
+  end # def process_local_file
 
   private
-  def local_decorate_and_queue(event, queue, key, folder, metadata, bucket)
+  def local_decorate_and_queue(event, queue, key, folder, bucket)
     @logger.debug('decorating event', :event => event.to_s)
-    if event_is_metadata?(event)
-      @logger.debug('Event is metadata, updating the current cloudfront metadata', :event => event)
-      update_metadata(metadata, event)
-    else
+	decorate(event)
 
-      decorate(event)
-
-      event.set("cloudfront_version", metadata[:cloudfront_version]) unless metadata[:cloudfront_version].nil?
-      event.set("cloudfront_fields", metadata[:cloudfront_fields]) unless metadata[:cloudfront_fields].nil?
-
-      event.set("[@metadata][s3][object_key]", key)
-      event.set("[@metadata][s3][bucket_name]", bucket)
-      event.set("[@metadata][s3][object_folder]", folder)
-      @logger.debug('add metadata', :object_key => key, :bucket => bucket, :folder => folder)
-      queue << event
-    end
+	event.set("[@metadata][s3][object_key]", key)
+	event.set("[@metadata][s3][bucket_name]", bucket)
+	event.set("[@metadata][s3][object_folder]", folder)
+	@logger.debug('add metadata', :object_key => key, :bucket => bucket, :folder => folder)
+	queue << event
   end
 
 
@@ -418,36 +390,6 @@ class LogStash::Inputs::S3SNSSQS < LogStash::Inputs::Threadable
         role_arn: @s3_role_arn,
         role_session_name: @s3_role_session_name
     )
-  end
-
-  private
-  def event_is_metadata?(event)
-    return false unless event.get("message").class == String
-    line = event.get("message")
-    version_metadata?(line) || fields_metadata?(line)
-  end
-
-  private
-  def version_metadata?(line)
-    line.start_with?('#Version: ')
-  end
-
-  private
-  def fields_metadata?(line)
-    line.start_with?('#Fields: ')
-  end
-
-  private
-  def update_metadata(metadata, event)
-    line = event.get('message').strip
-
-    if version_metadata?(line)
-      metadata[:cloudfront_version] = line.split(/#Version: (.+)/).last
-    end
-
-    if fields_metadata?(line)
-      metadata[:cloudfront_fields] = line.split(/#Fields: (.+)/).last
-    end
   end
 
   public
@@ -541,20 +483,6 @@ class LogStash::Inputs::S3SNSSQS < LogStash::Inputs::Threadable
       sleep(next_sleep)
       next_sleep =  next_sleep > max_time ? sleep_time : sleep_time * BACKOFF_FACTOR
       retry
-    end
-  end
-
-  private
-  def hash_key_is_regex(myhash)
-    myhash.default_proc = lambda do |hash, lookup|
-      result=nil
-      hash.each_pair do |key, value|
-        if %r[#{key}] =~ lookup
-          result=value
-          break
-        end
-      end
-      result
     end
   end
 end # class
